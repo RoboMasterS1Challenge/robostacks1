@@ -1,1 +1,2 @@
-# M5Stack Controller for RoboMaster S1
+# RoboStack S1
+M5Stack Controller for RoboMaster S1

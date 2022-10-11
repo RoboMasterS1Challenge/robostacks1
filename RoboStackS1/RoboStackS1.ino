@@ -1,5 +1,6 @@
-#include <PS4Controller.h>
+
 #include <M5Core2.h>
+#include <PS4Controller.h>
 #include <CAN.h>
 
 #include "robomaster_s1.h"
@@ -7,52 +8,55 @@
 
 hw_timer_t *timer = NULL;
 
+uint16_t command_counter[COMMAND_LIST_SIZE];
+uint16_t counter_led = 0;
+uint16_t counter_blaster = 0;
+uint16_t counter_gel_blaster = 0;
+uint16_t counter_lose = 0;
+uint16_t counter_mode = 0;
 
-volatile uint16_t command_counter[COMMAND_LIST_SIZE];
-volatile uint16_t counter_led = 0;
-volatile uint16_t counter_blaster = 0;
-volatile uint16_t counter_gel_blaster = 0;
-volatile uint16_t counter_lose = 0;
-volatile uint16_t counter_mode = 0;
-CANRxMsg rx_msg_buffer[BUFFER_SIZE];
-volatile int buffer_rp = 0;
-volatile int buffer_wp = 0;
+// Command
+twist command_vel;
+int command_blaster;
+int command_gel_blaster;
+int command_lose;
+int command_control_mode;
+led command_led;
 
-volatile uint8_t can_command_buffer[BUFFER_SIZE];
-volatile int can_command_buffer_rp = 0;
-volatile int can_command_buffer_wp = 0;
+#define COMMAND_VEL_TIMEOUT 150
+uint16_t command_vel_timeout_count = COMMAND_VEL_TIMEOUT;
 
-extern twist command_twist;
-extern int command_blaster;
-extern int command_gel_blaster;
-extern int command_lose;
-extern led command_led;
+#define ROBOMASTER_S1_CAN_TIMEOUT 100
+uint16_t robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
+uint8_t robomasters1_can_timeout = 0;
 
+CANRxMsg rx_msg_buffer[CAN_RX_BUFFER_SIZE];
+int buffer_rp = 0;
+int buffer_wp = 0;
 
-volatile int initial_task_number = 0;
+uint8_t can_command_buffer[TX_BUFFER_SIZE];
+int can_command_buffer_rp = 0;
+int can_command_buffer_wp = 0;
 
-uint8_t received_data[255];
+int initial_task_number = 0;
+
+uint8_t received_data[0xFF];
 uint8_t received_data_size = 0;
-int i = 0;
-int ret = 0;
 
-double gimbal_base_yaw_angle = 0;
-double gimbal_map_yaw_angle = 0;
-double gimbal_base_pitch_angle = 0;
-double gimbal_map_pitch_angle = 0;
-
-int chasis_control_mode = 0;
-
+float gimbal_base_pan_angle = 0;
+float gimbal_map_pan_angle = 0;
+float gimbal_base_tilt_angle = 0;
+float gimbal_map_tilt_angle = 0;
 
 // Timer
-volatile uint8_t timer10sec_flag = 0;
-volatile uint32_t timer10sec_counter = 0;
-volatile uint8_t timer1sec_flag = 0;
-volatile uint32_t timer1sec_counter = 0;
-volatile uint8_t timer10msec_flag = 0;
-volatile uint32_t timer10msec_counter = 0;
-volatile uint8_t timer100msec_flag = 0;
-volatile uint32_t timer100msec_counter = 0;
+uint8_t timer10sec_flag = 0;
+uint32_t timer10sec_counter = 0;
+uint8_t timer1sec_flag = 0;
+uint32_t timer1sec_counter = 0;
+uint8_t timer10msec_flag = 0;
+uint64_t timer10msec_counter = 0;
+uint8_t timer100msec_flag = 0;
+uint32_t timer100msec_counter = 0;
 
 // LED
 #define LED_LIST_NUM 4
@@ -62,6 +66,49 @@ led led_green = {1, 0, 255, 0};
 led led_blue = {1, 0, 0, 255};
 led led_list[LED_LIST_NUM] = {led_white, led_red, led_green, led_blue};
 int led_list_count = 0;
+
+// Wheel
+uint32_t odom_counter;
+uint32_t odom_counter2;
+float wheel_angle[4];
+int16_t wheel_angular_velocity[4];
+uint32_t m_bus_update_count[4];
+
+// IMU
+float mag_x;
+float mag_y;
+float g_x;
+float g_y;
+float g_z;
+float gyro_x;
+float gyro_y;
+float gyro_z;
+float roll, pitch, yaw;
+
+// chassis
+float filtered_vel_x1;
+float filtered_vel_y1;
+float filtered_vel_x2;
+float filtered_vel_y2;
+float unknown_data;
+quaternion base_pose_quaternion;
+float base_odom_yaw;
+int16_t voltage;
+int16_t temperature;
+uint32_t current;
+uint8_t battery_soc;
+
+// multi thread
+TaskHandle_t thp[1];
+
+// Multi thread core0 task
+void Core0a(void *args)
+{
+  while(1)
+  {
+    delayMicroseconds(10);
+  }
+}
 
 void IRAM_ATTR on10msecTimer()
 {
@@ -85,6 +132,21 @@ void IRAM_ATTR on10msecTimer()
   if (timer10msec_counter % 10 == 0)
   {
     timer100msec_flag = 1;
+  }
+
+  command_vel_timeout_count--;
+
+  if (command_vel_timeout_count == 0)
+  {
+    command_vel.enable = false;
+    command_vel_timeout_count = 1;
+  }
+
+  robomasters1_can_timeout_count--;
+  if (robomasters1_can_timeout_count == 0)
+  {
+    robomasters1_can_timeout_count = 1;
+    robomasters1_can_timeout = 1;
   }
 }
 
@@ -126,7 +188,7 @@ void set_can_command(uint8_t command_no)
   {
     can_command_buffer[can_command_buffer_wp] = header_command[i];
     can_command_buffer_wp++;
-    can_command_buffer_wp %= BUFFER_SIZE;
+    can_command_buffer_wp %= TX_BUFFER_SIZE;
   }
 }
 
@@ -186,23 +248,22 @@ void onReceive(int packetSize)
   }
   rx_msg_buffer[buffer_wp] = msg;
   buffer_wp++;
-  buffer_wp %= BUFFER_SIZE;
+  buffer_wp %= CAN_RX_BUFFER_SIZE;
 }
 
 void setup()
 {
   // put your setup code here, to run once:
+
+  M5.begin();
+  PS4.begin("8C:AA:B5:81:71:BA");
   // ESP32 Timer
   initializeTimer();
 
-  M5.begin(true, false, false, false);
-
-  PS4.begin("8C:AA:B5:81:71:BA");
-  
   // start the CAN bus at 500 kbps
   if (!CAN.begin(1000E3))
   {
-    //header("Starting CAN failed!", BLACK);
+    // header("Starting CAN failed!", BLACK);
     while (1)
       ;
   }
@@ -210,15 +271,23 @@ void setup()
   *pREG_IER &= ~(uint8_t)0x10;
 
   CAN.onReceive(onReceive);
+
+  // multi task
+  //xTaskCreatePinnedToCore(Core0a, "Core0a", 8192, NULL, 2, &thp[0], 0);
 }
 
 void loop()
 {
   // put your main code here, to run repeatedly:
+  if (robomasters1_can_timeout) // Timeout
+  {
+    delay(100);
+    return;
+  }
+
   // Initial Command 10sec after boot
   if (initial_task_number < 3)
   {
-
     // Initial Task 1
     if (timer100msec_flag == 1 && initial_task_number == 0)
     {
@@ -231,7 +300,7 @@ void loop()
         uint8_t header_command[0xFF];
         uint8_t idx = 0;
         uint8_t command_length = can_command_list[command_no][3];
-        for (i = 2; i < command_length; i++)
+        for (int i = 2; i < command_length; i++)
         {
           header_command[idx] = can_command_list[command_no][i];
 
@@ -247,7 +316,7 @@ void loop()
         {
           can_command_buffer[can_command_buffer_wp] = header_command[i];
           can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          can_command_buffer_wp %= TX_BUFFER_SIZE;
         }
       }
     }
@@ -264,7 +333,7 @@ void loop()
         uint8_t header_command[0xFF];
         uint8_t idx = 0;
         uint8_t command_length = can_command_list[command_no][3];
-        for (i = 2; i < command_length; i++)
+        for (int i = 2; i < command_length; i++)
         {
           header_command[idx] = can_command_list[command_no][i];
 
@@ -288,7 +357,7 @@ void loop()
         {
           can_command_buffer[can_command_buffer_wp] = header_command[i];
           can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          can_command_buffer_wp %= TX_BUFFER_SIZE;
         }
 
         counter_led++;
@@ -300,7 +369,7 @@ void loop()
         uint8_t header_command[0xFF];
         uint8_t idx = 0;
         uint8_t command_length = can_command_list[command_no][3];
-        for (i = 2; i < command_length; i++)
+        for (int i = 2; i < command_length; i++)
         {
           header_command[idx] = can_command_list[command_no][i];
 
@@ -324,7 +393,7 @@ void loop()
         {
           can_command_buffer[can_command_buffer_wp] = header_command[i];
           can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          can_command_buffer_wp %= TX_BUFFER_SIZE;
         }
 
         counter_mode++;
@@ -337,31 +406,28 @@ void loop()
       initial_task_number = 3;
       timer100msec_flag = 0;
 
-      // Enable Odometry Output???
-      // for (int command_no = 35; command_no < 40; command_no++)
+      // Enable Odometry
+      int command_no = 35;
+      uint8_t header_command[0xFF];
+      uint8_t idx = 0;
+      uint8_t command_length = can_command_list[command_no][3];
+      for (int i = 2; i < command_length; i++)
       {
-        int command_no = 35;
-        uint8_t header_command[0xFF];
-        uint8_t idx = 0;
-        uint8_t command_length = can_command_list[command_no][3];
-        for (i = 2; i < command_length; i++)
-        {
-          header_command[idx] = can_command_list[command_no][i];
+        header_command[idx] = can_command_list[command_no][i];
 
-          if (i == 5 && can_command_list[command_no][5] == 0xFF)
-          {
-            appendCRC8CheckSum(header_command, 4);
-          }
-
-          idx++;
-        }
-        appendCRC16CheckSum(header_command, command_length);
-        for (int i = 0; i < command_length; i++)
+        if (i == 5 && can_command_list[command_no][5] == 0xFF)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          appendCRC8CheckSum(header_command, 4);
         }
+
+        idx++;
+      }
+      appendCRC16CheckSum(header_command, command_length);
+      for (int i = 0; i < command_length; i++)
+      {
+        can_command_buffer[can_command_buffer_wp] = header_command[i];
+        can_command_buffer_wp++;
+        can_command_buffer_wp %= TX_BUFFER_SIZE;
       }
     }
   }
@@ -383,7 +449,7 @@ void loop()
         uint8_t header_command[0xFF];
         uint8_t idx = 0;
         uint8_t command_length = can_command_list[command_no][3];
-        for (i = 2; i < command_length; i++)
+        for (int i = 2; i < command_length; i++)
         {
           header_command[idx] = can_command_list[command_no][i];
 
@@ -408,7 +474,7 @@ void loop()
         {
           can_command_buffer[can_command_buffer_wp] = header_command[i];
           can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          can_command_buffer_wp %= TX_BUFFER_SIZE;
         }
 
         counter_lose++;
@@ -423,7 +489,7 @@ void loop()
         uint8_t header_command[0xFF];
         uint8_t idx = 0;
         uint8_t command_length = can_command_list[command_no][3];
-        for (i = 2; i < command_length; i++)
+        for (int i = 2; i < command_length; i++)
         {
           header_command[idx] = can_command_list[command_no][i];
 
@@ -448,7 +514,7 @@ void loop()
         {
           can_command_buffer[can_command_buffer_wp] = header_command[i];
           can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          can_command_buffer_wp %= TX_BUFFER_SIZE;
         }
 
         counter_lose++;
@@ -464,7 +530,7 @@ void loop()
           uint8_t header_command[0xFF];
           uint8_t idx = 0;
           uint8_t command_length = can_command_list[command_no][3];
-          for (i = 2; i < command_length; i++)
+          for (int i = 2; i < command_length; i++)
           {
             header_command[idx] = can_command_list[command_no][i];
 
@@ -507,7 +573,7 @@ void loop()
           {
             can_command_buffer[can_command_buffer_wp] = header_command[i];
             can_command_buffer_wp++;
-            can_command_buffer_wp %= BUFFER_SIZE;
+            can_command_buffer_wp %= TX_BUFFER_SIZE;
           }
 
           counter_led++;
@@ -525,7 +591,7 @@ void loop()
           uint8_t header_command[0xFF];
           uint8_t idx = 0;
           uint8_t command_length = can_command_list[command_no][3];
-          for (i = 2; i < command_length; i++)
+          for (int i = 2; i < command_length; i++)
           {
             header_command[idx] = can_command_list[command_no][i];
 
@@ -550,7 +616,7 @@ void loop()
           {
             can_command_buffer[can_command_buffer_wp] = header_command[i];
             can_command_buffer_wp++;
-            can_command_buffer_wp %= BUFFER_SIZE;
+            can_command_buffer_wp %= TX_BUFFER_SIZE;
           }
 
           counter_blaster++;
@@ -568,7 +634,7 @@ void loop()
           uint8_t header_command[0xFF];
           uint8_t idx = 0;
           uint8_t command_length = can_command_list[command_no][3];
-          for (i = 2; i < command_length; i++)
+          for (int i = 2; i < command_length; i++)
           {
             header_command[idx] = can_command_list[command_no][i];
 
@@ -593,7 +659,7 @@ void loop()
           {
             can_command_buffer[can_command_buffer_wp] = header_command[i];
             can_command_buffer_wp++;
-            can_command_buffer_wp %= BUFFER_SIZE;
+            can_command_buffer_wp %= TX_BUFFER_SIZE;
           }
 
           counter_gel_blaster++;
@@ -608,14 +674,21 @@ void loop()
         uint8_t idx = 0;
 
         // Linear X and Y
-        uint16_t linear_x = 256 * command_twist.twist_linear.x + 1024;
-        uint16_t linear_y = 256 * command_twist.twist_linear.y + 1024;
-        int16_t angular_z = 0;
-        if(chasis_control_mode){
-          angular_z = 256 * command_twist.twist_angular.z + 1024;
+        uint16_t linear_x = 1024;
+        uint16_t linear_y = 1024;
+        int16_t angular_z = 1024;
+        if (command_vel.enable)
+        {
+          linear_x = 256 * command_vel.twist_linear.x + 1024;
+          linear_y = 256 * command_vel.twist_linear.y + 1024;
+          angular_z = 0;
+          if (command_control_mode)
+          {
+            angular_z = 256 * command_vel.twist_angular.z + 1024;
+          }
         }
 
-        for (i = 2; i < command_length; i++)
+        for (int i = 2; i < command_length; i++)
         {
           header_command[idx] = can_command_list[command_no][i];
 
@@ -684,7 +757,7 @@ void loop()
         {
           can_command_buffer[can_command_buffer_wp] = header_command[i];
           can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          can_command_buffer_wp %= TX_BUFFER_SIZE;
         }
       }
 
@@ -696,10 +769,15 @@ void loop()
         uint8_t idx = 0;
 
         // Angular X and Y
-        int16_t angular_y = -1024 * command_twist.twist_angular.y;
-        int16_t angular_z = -1024 * command_twist.twist_angular.z;
+        int16_t angular_y = 0;
+        int16_t angular_z = 0;
+        if (command_vel.enable)
+        {
+          angular_y = -1024 * command_vel.twist_angular.y;
+          angular_z = -1024 * command_vel.twist_angular.z;
+        }
 
-        for (i = 2; i < command_length; i++)
+        for (int i = 2; i < command_length; i++)
         {
           header_command[idx] = can_command_list[command_no][i];
 
@@ -742,12 +820,12 @@ void loop()
         {
           can_command_buffer[can_command_buffer_wp] = header_command[i];
           can_command_buffer_wp++;
-          can_command_buffer_wp %= BUFFER_SIZE;
+          can_command_buffer_wp %= TX_BUFFER_SIZE;
         }
       }
 
       // Register 10msec Task
-      for (i = 0; i < COMMAND_LIST_SIZE; i++)
+      for (int i = 0; i < COMMAND_LIST_SIZE; i++)
       {
         if (can_command_list[i][1] == 1 && i != 5 && i != 4)
         {
@@ -761,7 +839,7 @@ void loop()
     {
       timer100msec_flag = 0;
 
-      for (i = 0; i < COMMAND_LIST_SIZE; i++)
+      for (int i = 0; i < COMMAND_LIST_SIZE; i++)
       {
         if (can_command_list[i][1] == 10)
         {
@@ -775,7 +853,7 @@ void loop()
     {
       timer1sec_flag = 0;
 
-      for (i = 0; i < COMMAND_LIST_SIZE; i++)
+      for (int i = 0; i < COMMAND_LIST_SIZE; i++)
       {
         if (can_command_list[i][1] == 100)
         {
@@ -791,14 +869,13 @@ void loop()
     }
   }
 
-
   // Transmit CAN Command
   while (can_command_buffer_rp != can_command_buffer_wp)
   {
     uint8_t TxData[8];
     uint8_t dlc = 0;
 
-    int can_command_buffer_size = (can_command_buffer_wp - can_command_buffer_rp + BUFFER_SIZE) % BUFFER_SIZE;
+    int can_command_buffer_size = (can_command_buffer_wp - can_command_buffer_rp + TX_BUFFER_SIZE) % TX_BUFFER_SIZE;
     if (can_command_buffer_size >= 8)
     {
       dlc = 8;
@@ -808,31 +885,27 @@ void loop()
       dlc = can_command_buffer_size;
     }
     CAN.beginPacket(0x201);
-    for (i = 0; i < dlc; i++)
+    for (int i = 0; i < dlc; i++)
     {
-      CAN.write(can_command_buffer[(can_command_buffer_rp + i) % BUFFER_SIZE]);
+      CAN.write(can_command_buffer[(can_command_buffer_rp + i) % TX_BUFFER_SIZE]);
     }
     // Start Transmission process
     CAN.endPacket();
     can_command_buffer_rp += dlc;
-    can_command_buffer_rp %= BUFFER_SIZE;
+    can_command_buffer_rp %= TX_BUFFER_SIZE;
   }
-
 
   // Receive from RoboMaster S1
   while (buffer_rp != buffer_wp)
   {
     CANRxMsg msg;
     msg = rx_msg_buffer[buffer_rp];
-    ret = parseCanData(msg.can_id, msg.data, msg.dlc, received_data, &received_data_size);
+    int ret = parseCanData(msg.can_id, msg.data, msg.dlc, received_data, &received_data_size);
     buffer_rp++;
-    buffer_rp %= BUFFER_SIZE;
+    buffer_rp %= CAN_RX_BUFFER_SIZE;
     if (ret)
     {
-      float_uint8 base_odom_yaw_raw[5];
-      float_uint8 quaternion[4];
-      uint32_t base_odom_yaw;
-
+      robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
       switch (msg.can_id)
       {
 
@@ -843,13 +916,13 @@ void loop()
         {
           int flag = (received_data[24] >> 7) & 0x01;
           base_odom_yaw = ((((uint16_t)received_data[24]) << 8) | (((uint16_t)received_data[23]) << 0));
-          if (flag == 0)
+          if (flag == 0) // minus
           {
             int shift = (0x86 - ((received_data[24] << 1) | (received_data[23] >> 7)));
             base_odom_yaw = ((1 << 7) | received_data[23]) >> shift;
             base_odom_yaw *= -1;
           }
-          else
+          else // plus
           {
             int shift = (0x186 - ((received_data[24] << 1) | (received_data[23] >> 7)));
             base_odom_yaw = ((1 << 7) | received_data[23]) >> shift;
@@ -860,65 +933,74 @@ void loop()
           }
 
           // unknown angle filtered value
-          base_odom_yaw_raw[0].uint8_data[0] = received_data[35];
-          base_odom_yaw_raw[0].uint8_data[1] = received_data[36];
-          base_odom_yaw_raw[0].uint8_data[2] = received_data[37];
-          base_odom_yaw_raw[0].uint8_data[3] = received_data[38];
-          base_odom_yaw_raw[1].uint8_data[0] = received_data[39];
-          base_odom_yaw_raw[1].uint8_data[1] = received_data[40];
-          base_odom_yaw_raw[1].uint8_data[2] = received_data[41];
-          base_odom_yaw_raw[1].uint8_data[3] = received_data[42];
-          base_odom_yaw_raw[2].uint8_data[0] = received_data[43];
-          base_odom_yaw_raw[2].uint8_data[1] = received_data[44];
-          base_odom_yaw_raw[2].uint8_data[2] = received_data[45];
-          base_odom_yaw_raw[2].uint8_data[3] = received_data[46];
-          base_odom_yaw_raw[3].uint8_data[0] = received_data[47];
-          base_odom_yaw_raw[3].uint8_data[1] = received_data[48];
-          base_odom_yaw_raw[3].uint8_data[2] = received_data[49];
-          base_odom_yaw_raw[3].uint8_data[3] = received_data[50];
-          base_odom_yaw_raw[4].uint8_data[0] = received_data[51];
-          base_odom_yaw_raw[4].uint8_data[1] = received_data[52];
-          base_odom_yaw_raw[4].uint8_data[2] = received_data[53];
-          base_odom_yaw_raw[4].uint8_data[3] = received_data[54];
-
+          float_uint8 base_odom_yaw_union[5];
+          base_odom_yaw_union[0].uint8_data[0] = received_data[35];
+          base_odom_yaw_union[0].uint8_data[1] = received_data[36];
+          base_odom_yaw_union[0].uint8_data[2] = received_data[37];
+          base_odom_yaw_union[0].uint8_data[3] = received_data[38];
+          base_odom_yaw_union[1].uint8_data[0] = received_data[39];
+          base_odom_yaw_union[1].uint8_data[1] = received_data[40];
+          base_odom_yaw_union[1].uint8_data[2] = received_data[41];
+          base_odom_yaw_union[1].uint8_data[3] = received_data[42];
+          base_odom_yaw_union[2].uint8_data[0] = received_data[43];
+          base_odom_yaw_union[2].uint8_data[1] = received_data[44];
+          base_odom_yaw_union[2].uint8_data[2] = received_data[45];
+          base_odom_yaw_union[2].uint8_data[3] = received_data[46];
+          base_odom_yaw_union[3].uint8_data[0] = received_data[47];
+          base_odom_yaw_union[3].uint8_data[1] = received_data[48];
+          base_odom_yaw_union[3].uint8_data[2] = received_data[49];
+          base_odom_yaw_union[3].uint8_data[3] = received_data[50];
+          base_odom_yaw_union[4].uint8_data[0] = received_data[51];
+          base_odom_yaw_union[4].uint8_data[1] = received_data[52];
+          base_odom_yaw_union[4].uint8_data[2] = received_data[53];
+          base_odom_yaw_union[4].uint8_data[3] = received_data[54];
+          filtered_vel_x1 = base_odom_yaw_union[0].float_data;
+          filtered_vel_y1 = base_odom_yaw_union[1].float_data;
+          unknown_data = base_odom_yaw_union[2].float_data;
+          filtered_vel_x2 = base_odom_yaw_union[3].float_data;
+          filtered_vel_y1 = base_odom_yaw_union[4].float_data;
         }
 
         if (received_data[1] == 0x31 && received_data[4] == 0x03 && received_data[5] == 0x04)
         {
           // ~20 is unknown counter and state
-          quaternion[0].uint8_data[0] = received_data[21];
-          quaternion[0].uint8_data[1] = received_data[22];
-          quaternion[0].uint8_data[2] = received_data[23];
-          quaternion[0].uint8_data[3] = received_data[24];
-          quaternion[1].uint8_data[0] = received_data[25];
-          quaternion[1].uint8_data[1] = received_data[26];
-          quaternion[1].uint8_data[2] = received_data[27];
-          quaternion[1].uint8_data[3] = received_data[28];
-          quaternion[2].uint8_data[0] = received_data[29];
-          quaternion[2].uint8_data[1] = received_data[30];
-          quaternion[2].uint8_data[2] = received_data[31];
-          quaternion[2].uint8_data[3] = received_data[32];
-          quaternion[3].uint8_data[0] = received_data[33];
-          quaternion[3].uint8_data[1] = received_data[34];
-          quaternion[3].uint8_data[2] = received_data[35];
-          quaternion[3].uint8_data[3] = received_data[36];
+          float_uint8 quaternion_union[4];
+          quaternion_union[0].uint8_data[0] = received_data[21];
+          quaternion_union[0].uint8_data[1] = received_data[22];
+          quaternion_union[0].uint8_data[2] = received_data[23];
+          quaternion_union[0].uint8_data[3] = received_data[24];
+          quaternion_union[1].uint8_data[0] = received_data[25];
+          quaternion_union[1].uint8_data[1] = received_data[26];
+          quaternion_union[1].uint8_data[2] = received_data[27];
+          quaternion_union[1].uint8_data[3] = received_data[28];
+          quaternion_union[2].uint8_data[0] = received_data[29];
+          quaternion_union[2].uint8_data[1] = received_data[30];
+          quaternion_union[2].uint8_data[2] = received_data[31];
+          quaternion_union[2].uint8_data[3] = received_data[32];
+          quaternion_union[3].uint8_data[0] = received_data[33];
+          quaternion_union[3].uint8_data[1] = received_data[34];
+          quaternion_union[3].uint8_data[2] = received_data[35];
+          quaternion_union[3].uint8_data[3] = received_data[36];
+          base_pose_quaternion.w = quaternion_union[0].float_data;
+          base_pose_quaternion.x = quaternion_union[1].float_data;
+          base_pose_quaternion.y = quaternion_union[2].float_data;
+          base_pose_quaternion.z = quaternion_union[3].float_data;
 
-          int32_t int_data1;
-          uint32_t uint32_data = received_data[40];
-          uint32_data = (uint32_data << 8) | received_data[39];
-          uint32_data = (uint32_data << 8) | received_data[38];
-          uint32_data = (uint32_data << 8) | received_data[37];
-          int_data1 = (int32_t)uint32_data;
+          uint16_t uint16_data = received_data[38];
+          uint16_data = (uint16_data << 8) | received_data[37];
+          voltage = (int16_t)uint16_data;
 
-          int32_t int_data2;
-          uint32_data = received_data[44];
+          uint16_data = received_data[40];
+          uint16_data = (uint16_data << 8) | received_data[39];
+          temperature = (int16_t)uint16_data;
+
+          uint32_t uint32_data = received_data[44];
           uint32_data = (uint32_data << 8) | received_data[43];
           uint32_data = (uint32_data << 8) | received_data[42];
           uint32_data = (uint32_data << 8) | received_data[41];
-          int_data2 = (int32_t)uint32_data;
+          current = -(int32_t)uint32_data;
 
-          uint8_t battery_soc = received_data[45];
-
+          battery_soc = received_data[45];
         }
 
         // Counter
@@ -941,19 +1023,17 @@ void loop()
           uint16_t data16;
           int16_t int_data16;
 
-          int16_t wheel_angular_velocity[4];
-
           data = received_data[16];
           data = (data << 8) | received_data[15];
           data = (data << 8) | received_data[14];
           data = (data << 8) | received_data[13];
-          uint32_t odom_counter = (int32_t)data;
+          odom_counter = (uint32_t)data;
 
           data = received_data[20];
           data = (data << 8) | received_data[19];
           data = (data << 8) | received_data[18];
           data = (data << 8) | received_data[17];
-          uint32_t odom_counter2 = (int32_t)data;
+          odom_counter2 = (uint32_t)data;
 
           // Wheel Angular Velocity
           // Unit is RPM
@@ -973,7 +1053,6 @@ void loop()
           data16 = (data16 << 8) | received_data[27];
           wheel_angular_velocity[3] = (int16_t)data16;
 
-          float wheel_angle[4];
           // wheel position
           data16 = received_data[30];
           data16 = (data16 << 8) | received_data[29];
@@ -999,7 +1078,7 @@ void loop()
           int_data16 = (int16_t)data16;
           wheel_angle[3] = int_data16 / 32767.0 * 180.0;
 
-          uint32_t m_bus_update_count[4];
+          m_bus_update_count[4];
           // wheel update count
           data = received_data[40];
           data = (data << 8) | received_data[39];
@@ -1027,16 +1106,6 @@ void loop()
 
           // IMU Data
           float_uint8 union_data;
-
-          float mag_x;
-          float mag_y;
-          float g_x;
-          float g_y;
-          float g_z;
-          float gyro_x;
-          float gyro_y;
-          float gyro_z;
-          float roll, pitch, yaw;
 
           union_data.uint8_data[0] = received_data[53 + 4];
           union_data.uint8_data[1] = received_data[54 + 4];
@@ -1105,53 +1174,50 @@ void loop()
           union_data.uint8_data[2] = received_data[55 + 4 * 13];
           union_data.uint8_data[3] = received_data[56 + 4 * 13];
           roll = union_data.float_data;
-
         }
 
         break;
       }
 
       // Gimbal Output Data
-      case ID_0x203: //0x203
+      case ID_0x203: // 0x203
       {
         // From Gimbal
         if (received_data[1] == 0x11 && received_data[4] == 0x04 && received_data[5] == 0x03)
         {
-          // Yaw Angle
+          // Pan Angle
           uint16_t data = received_data[12];
           data = (data << 8) | received_data[11];
-          gimbal_base_yaw_angle = -(int16_t)(data) / 10.0;
+          gimbal_base_pan_angle = -(int16_t)(data) / 10.0 * 3.141592 / 180;
           data = received_data[14];
           data = (data << 8) | received_data[13];
-          gimbal_map_yaw_angle = -(int16_t)(data) / 100.0;
-
+          gimbal_map_pan_angle = -(int16_t)(data) / 100.0 * 3.141592 / 180;
         }
         if (received_data[1] == 0x16 && received_data[4] == 0x04 && received_data[5] == 0x09)
         {
-          // Pitch Angle
+          // Tilt Angle
           uint32_t data = received_data[14];
           data = (data << 8) | received_data[13];
           data = (data << 8) | received_data[12];
           data = (data << 8) | received_data[11];
-          gimbal_map_pitch_angle = (int32_t)(data) / 20000000.0 * 30.0;
+          gimbal_map_tilt_angle = (-(int32_t)(data) / 65536.0 / 10 - 7.6) * 3.141592 / 180;
           data = received_data[18];
           data = (data << 8) | received_data[17];
           data = (data << 8) | received_data[16];
           data = (data << 8) | received_data[15];
-          gimbal_base_pitch_angle = (int32_t)(data) / 20000000.0 * 30.0;
-          //printf("%lf, %lf\n", gimbal_map_pitch_angle_, gimbal_base_pitch_angle_);
-
+          gimbal_base_tilt_angle = (-(int32_t)(data) / 65536.0 / 10 - 7.6) * 3.141592 / 180;
+          // printf("%lf, %lf\n", gimbal_map_tilt_angle_, gimbal_base_tilt_angle_);
         }
         break;
       }
-      case ID_0x204: //0x204
+      case ID_0x204: // 0x204
       {
         if (received_data[4] == 0x17 && received_data[5] == 0x09)
         {
         }
         break;
       }
-      case ID_0x211: //BACK SENSOR
+      case ID_0x211: // BACK SENSOR
       {
         if (received_data[4] == 0x38 && received_data[5] == 0x09) // or 1D
         {
@@ -1163,7 +1229,7 @@ void loop()
         }
         break;
       }
-      case ID_0x212: //FRONT SENSOR
+      case ID_0x212: // FRONT SENSOR
       {
         if (received_data[4] == 0x58 && received_data[5] == 0x09) // or 1D
         {
@@ -1175,7 +1241,7 @@ void loop()
         }
         break;
       }
-      case ID_0x213: //LEFT SENSOR
+      case ID_0x213: // LEFT SENSOR
       {
         if (received_data[4] == 0x78 && received_data[5] == 0x09) // or 1D
         {
@@ -1187,7 +1253,7 @@ void loop()
         }
         break;
       }
-      case ID_0x214: //RIGHT SENSOR
+      case ID_0x214: // RIGHT SENSOR
       {
         if (received_data[4] == 0x98 && received_data[5] == 0x09) // or 1D
         {
@@ -1199,7 +1265,7 @@ void loop()
         }
         break;
       }
-      case ID_0x215: //GIMBAL SENSOR LIGHT
+      case ID_0x215: // GIMBAL SENSOR LEFT
       {
         if (received_data[4] == 0xB8 && received_data[5] == 0x09) // or 1D
         {
@@ -1211,7 +1277,7 @@ void loop()
         }
         break;
       }
-      case ID_0x216: //GIMBAL SENSOR RIGHT
+      case ID_0x216: // GIMBAL SENSOR RIGHT
       {
         if (received_data[4] == 0xD8 && received_data[5] == 0x09) // or 1D
         {
@@ -1231,53 +1297,70 @@ void loop()
     }
   }
 
-
   // Get PS4 Key
-  if (PS4.isConnected()) {
-    if (PS4.Cross()){
+  if (PS4.isConnected())
+  {
+    if (PS4.Cross())
+    {
       command_blaster = 1;
     }
-    if (PS4.Circle()){
+    if (PS4.Circle())
+    {
       command_gel_blaster = 1;
     }
-    if (PS4.Triangle()){
+    if (PS4.Triangle())
+    {
       command_lose = 1;
     }
-    if (PS4.Square()){
+    if (PS4.Square())
+    {
       command_lose = 2;
     }
-    
-    if (PS4.R2()){
-        command_led = led_list[led_list_count];
-        led_list_count++;
-        led_list_count %= LED_LIST_NUM;
+
+    if (PS4.R2())
+    {
+      command_led = led_list[led_list_count];
+      led_list_count++;
+      led_list_count %= LED_LIST_NUM;
     }
-    if (PS4.L2()){
-        command_led = led_list[led_list_count];
-        led_list_count--;
-        led_list_count %= LED_LIST_NUM;
+    if (PS4.L2())
+    {
+      command_led = led_list[led_list_count];
+      led_list_count--;
+      led_list_count %= LED_LIST_NUM;
     }
 
-    if (PS4.R1()){
-      chasis_control_mode = 0;
-    }else{
-      chasis_control_mode = 1;
+    if (PS4.R1())
+    {
+      command_control_mode = 0;
+    }
+    else
+    {
+      command_control_mode = 1;
     }
 
-    if (PS4.L1()){
-      //M5.Lcd.printf("X: %d",PS4.LStickX()); // -128 to 128
-      command_twist.twist_linear.x = PS4.LStickY() / 256.0;
-      command_twist.twist_linear.y = PS4.LStickX() / 256.0;
-      command_twist.twist_angular.y = PS4.RStickY() / 256.0 / 10.0;
-      command_twist.twist_angular.z = -PS4.RStickX() / 256.0 / 10.0;
-    }else{
-      command_twist.twist_linear.x = 0;
-      command_twist.twist_linear.y = 0;
-      command_twist.twist_angular.y = 0;
-      command_twist.twist_angular.z = 0;
+    if (PS4.L1())
+    {
+      // M5.Lcd.printf("X: %d",PS4.LStickX()); // -128 to 128
+      command_vel_timeout_count = COMMAND_VEL_TIMEOUT;
+      command_vel.enable = true;
+      command_vel.twist_linear.x = PS4.LStickY() / 256.0;
+      command_vel.twist_linear.y = PS4.LStickX() / 256.0;
+      command_vel.twist_angular.y = PS4.RStickY() / 256.0 / 10.0;
+      command_vel.twist_angular.z = -PS4.RStickX() / 256.0 / 10.0;
+    }
+    else
+    {
+      command_vel_timeout_count = COMMAND_VEL_TIMEOUT;
+      command_vel.enable = false;
+      command_vel.twist_linear.x = 0;
+      command_vel.twist_linear.y = 0;
+      command_vel.twist_angular.y = 0;
+      command_vel.twist_angular.z = 0;
     }
     // if (PS4.LStickY()) {
     //   M5.Lcd.printf("Hello World");
     // }
   }
+  delayMicroseconds(10);
 }

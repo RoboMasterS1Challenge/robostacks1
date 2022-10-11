@@ -28,9 +28,9 @@
 #include "robomaster_s1.h"
 #include "command_list.h"
 
-#define MICRO_ROS_SSID "WirelessLAN"
-#define MICRO_ROS_PASSWD "tatsuya713"
-#define MICRO_ROS_SERVER_IP "192.168.23.4"
+#define MICRO_ROS_SSID "WirelessLAN_SSD"
+#define MICRO_ROS_PASSWD "XXXXXXXX"
+#define MICRO_ROS_SERVER_IP "YOUR IP"
 #define MICRO_ROS_SERVER_PORT 8888
 
 #define RCCHECK(fn)              \

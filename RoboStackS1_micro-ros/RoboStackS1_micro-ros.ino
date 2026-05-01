@@ -10,6 +10,7 @@
 #include <micro_ros_arduino.h>
 
 #include <stdio.h>
+#include <string.h>
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
@@ -73,19 +74,30 @@ int command_control_mode;
 led command_led;
 
 #define COMMAND_VEL_TIMEOUT 150
-uint16_t command_vel_timeout_count = COMMAND_VEL_TIMEOUT;
+volatile uint16_t command_vel_timeout_count = COMMAND_VEL_TIMEOUT;
 
 #define ROBOMASTER_S1_CAN_TIMEOUT 100
-uint16_t robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
-uint8_t robomasters1_can_timeout = 0;
+volatile uint16_t robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
+volatile uint8_t robomasters1_can_timeout = 0;
 
 CANRxMsg rx_msg_buffer[CAN_RX_BUFFER_SIZE];
-int buffer_rp = 0;
-int buffer_wp = 0;
+volatile int buffer_rp = 0;
+volatile int buffer_wp = 0;
 
 uint8_t can_command_buffer[TX_BUFFER_SIZE];
 int can_command_buffer_rp = 0;
 int can_command_buffer_wp = 0;
+
+static inline void enqueue_can_command_byte(uint8_t value)
+{
+  int next_wp = (can_command_buffer_wp + 1) % TX_BUFFER_SIZE;
+  if (next_wp == can_command_buffer_rp)
+  {
+    return;
+  }
+  can_command_buffer[can_command_buffer_wp] = value;
+  can_command_buffer_wp = next_wp;
+}
 
 int initial_task_number = 0;
 
@@ -99,14 +111,11 @@ float gimbal_map_tilt_angle = 0;
 uint8_t gimbal_receive_state = 0;
 
 // Timer
-uint8_t timer10sec_flag = 0;
-uint32_t timer10sec_counter = 0;
-uint8_t timer1sec_flag = 0;
-uint32_t timer1sec_counter = 0;
-uint8_t timer10msec_flag = 0;
-uint64_t timer10msec_counter = 0;
-uint8_t timer100msec_flag = 0;
-uint32_t timer100msec_counter = 0;
+volatile uint8_t timer10sec_flag = 0;
+volatile uint8_t timer1sec_flag = 0;
+volatile uint8_t timer10msec_flag = 0;
+volatile uint64_t timer10msec_counter = 0;
+volatile uint8_t timer100msec_flag = 0;
 
 // LED
 #define LED_LIST_NUM 4
@@ -148,10 +157,10 @@ int16_t temperature;
 uint32_t current;
 uint8_t battery_soc;
 
-uint8_t update_flag_chassis1 = 0;
-uint8_t update_flag_chassis2 = 0;
-uint8_t update_flag_chassis3 = 0;
-uint8_t update_flag_gimbal = 0;
+volatile uint8_t update_flag_chassis1 = 0;
+volatile uint8_t update_flag_chassis2 = 0;
+volatile uint8_t update_flag_chassis3 = 0;
+volatile uint8_t update_flag_gimbal = 0;
 
 // multi thread
 TaskHandle_t thp[1];
@@ -185,6 +194,54 @@ std_msgs__msg__Int8 control_mode_msg;
 
 #define BASE_LINK "base_link"
 #define ODOM_LINK "odom"
+
+float chassis_info2_data[5];
+float wheel_data[15];
+geometry_msgs__msg__TransformStamped odom_tf_data[1];
+char base_link_frame_id[16] = BASE_LINK;
+char odom_link_frame_id[16] = ODOM_LINK;
+char imu_frame_id[16] = BASE_LINK;
+char gimbal_frame_id[16] = BASE_LINK;
+rosidl_runtime_c__String gimbal_joint_names[2];
+char gimbal_base_joint_name[32] = "gimbal_base_link_joint";
+char gimbal_top_joint_name[32] = "guntop_link_joint";
+double gimbal_positions[2];
+
+void set_static_string(rosidl_runtime_c__String *field, char *data)
+{
+  field->data = data;
+  field->size = strlen(data);
+  field->capacity = field->size + 1;
+}
+
+void initialize_ros_message_storage()
+{
+  chassis_info2_msg.data.data = chassis_info2_data;
+  chassis_info2_msg.data.capacity = 5;
+  chassis_info2_msg.data.size = 5;
+
+  wheel_msg.data.data = wheel_data;
+  wheel_msg.data.capacity = 15;
+  wheel_msg.data.size = 15;
+
+  odom_tf_msg.transforms.data = odom_tf_data;
+  odom_tf_msg.transforms.capacity = 1;
+  odom_tf_msg.transforms.size = 1;
+  set_static_string(&odom_tf_msg.transforms.data[0].header.frame_id, base_link_frame_id);
+  set_static_string(&odom_tf_msg.transforms.data[0].child_frame_id, odom_link_frame_id);
+
+  set_static_string(&imu_msg.header.frame_id, imu_frame_id);
+
+  set_static_string(&gimbal_joint_state_msg.header.frame_id, gimbal_frame_id);
+  gimbal_joint_state_msg.name.data = gimbal_joint_names;
+  gimbal_joint_state_msg.name.capacity = 2;
+  gimbal_joint_state_msg.name.size = 2;
+  set_static_string(&gimbal_joint_state_msg.name.data[0], gimbal_base_joint_name);
+  set_static_string(&gimbal_joint_state_msg.name.data[1], gimbal_top_joint_name);
+  gimbal_joint_state_msg.position.data = gimbal_positions;
+  gimbal_joint_state_msg.position.capacity = 2;
+  gimbal_joint_state_msg.position.size = 2;
+}
 
 void twist_subscription_callback(const void *msgin)
 {
@@ -331,6 +388,8 @@ void Core0a(void *args)
   RCCHECK(rclc_executor_add_subscription(&executor, &command_blaster_subscriber, &blaster_msg, &blaster_subscription_callback, ON_NEW_DATA));
   RCCHECK(rclc_executor_add_subscription(&executor, &command_control_mode_subscriber, &control_mode_msg, &control_mode_subscription_callback, ON_NEW_DATA));
 
+  initialize_ros_message_storage();
+
   int update_count_chassis2 = 0;
 
   while (1)
@@ -340,19 +399,6 @@ void Core0a(void *args)
     if (update_flag_chassis1)
     {
       update_flag_chassis1 = 0;
-
-      // chassis_info1_msg.data.capacity = 7;
-      // chassis_info1_msg.data.data = (float *)malloc(chassis_info1_msg.data.capacity * sizeof(float));
-      // chassis_info1_msg.data.size = 7;
-      // chassis_info1_msg.data.data[0] = timer10msec_counter;
-      // chassis_info1_msg.data.data[1] = base_odom_yaw;
-      // chassis_info1_msg.data.data[2] = filtered_vel_x1;
-      // chassis_info1_msg.data.data[3] = filtered_vel_x2;
-      // chassis_info1_msg.data.data[4] = filtered_vel_y1;
-      // chassis_info1_msg.data.data[5] = filtered_vel_y2;
-      // chassis_info1_msg.data.data[6] = unknown_data;
-      // RCSOFTCHECK(rcl_publish(&chassis_info1_publisher, &chassis_info1_msg, NULL));
-      // free(chassis_info1_msg.data.data);
     }
     if (update_flag_chassis2)
     {
@@ -363,35 +409,16 @@ void Core0a(void *args)
       if (update_count_chassis2 % 50 == 0)
       { // 1Hz
         update_count_chassis2 = 0;
-        chassis_info2_msg.data.capacity = 5;
-        chassis_info2_msg.data.data = (float *)malloc(chassis_info2_msg.data.capacity * sizeof(float));
-        chassis_info2_msg.data.size = 5;
         chassis_info2_msg.data.data[0] = timer10msec_counter;
         chassis_info2_msg.data.data[1] = voltage / 1000.0;
         chassis_info2_msg.data.data[2] = temperature / 10.0;
         chassis_info2_msg.data.data[3] = current / 1000.0;
         chassis_info2_msg.data.data[4] = battery_soc;
         RCSOFTCHECK(rcl_publish(&chassis_info2_publisher, &chassis_info2_msg, NULL));
-        free(chassis_info2_msg.data.data);
       }
-
-      odom_tf_msg.transforms.capacity = 1;
-      odom_tf_msg.transforms.data = (geometry_msgs__msg__TransformStamped *)malloc(odom_tf_msg.transforms.capacity * sizeof(geometry_msgs__msg__TransformStamped));
-      odom_tf_msg.transforms.size = 1;
 
       odom_tf_msg.transforms.data[0].header.stamp.sec = (uint32_t)(timer10msec_counter / 100);
       odom_tf_msg.transforms.data[0].header.stamp.nanosec = (uint32_t)((timer10msec_counter % 100) * 10000000);
-      odom_tf_msg.transforms.data[0].header.frame_id.capacity = 100;
-      odom_tf_msg.transforms.data[0].header.frame_id.data = (char *)malloc(odom_tf_msg.transforms.data[0].header.frame_id.capacity * sizeof(char));
-      odom_tf_msg.transforms.data[0].header.frame_id.size = 0;
-      strcpy(odom_tf_msg.transforms.data[0].header.frame_id.data, BASE_LINK);
-      odom_tf_msg.transforms.data[0].header.frame_id.size = strlen(odom_tf_msg.transforms.data[0].header.frame_id.data);
-
-      odom_tf_msg.transforms.data[0].child_frame_id.capacity = 100;
-      odom_tf_msg.transforms.data[0].child_frame_id.data = (char *)malloc(odom_tf_msg.transforms.data[0].child_frame_id.capacity * sizeof(char));
-      odom_tf_msg.transforms.data[0].child_frame_id.size = 0;
-      strcpy(odom_tf_msg.transforms.data[0].child_frame_id.data, ODOM_LINK);
-      odom_tf_msg.transforms.data[0].child_frame_id.size = strlen(odom_tf_msg.transforms.data[0].child_frame_id.data);
 
       odom_tf_msg.transforms.data[0].transform.translation.x = (double)0.0;
       odom_tf_msg.transforms.data[0].transform.translation.y = (double)0.0;
@@ -402,18 +429,12 @@ void Core0a(void *args)
       odom_tf_msg.transforms.data[0].transform.rotation.w = (double)base_pose_quaternion.w;
 
       RCSOFTCHECK(rcl_publish(&odom_tf_publisher, &odom_tf_msg, NULL));
-      free(odom_tf_msg.transforms.data[0].header.frame_id.data);
-      free(odom_tf_msg.transforms.data[0].child_frame_id.data);
-      free(odom_tf_msg.transforms.data);
     }
 
     if (update_flag_chassis3)
     {
       update_flag_chassis3 = 0;
 
-      wheel_msg.data.capacity = 15;
-      wheel_msg.data.data = (float *)malloc(wheel_msg.data.capacity * sizeof(float));
-      wheel_msg.data.size = 15;
       wheel_msg.data.data[0] = timer10msec_counter;
       wheel_msg.data.data[1] = odom_counter;
       wheel_msg.data.data[2] = odom_counter2;
@@ -430,15 +451,9 @@ void Core0a(void *args)
       wheel_msg.data.data[13] = wheel_angle[3];
       wheel_msg.data.data[14] = wheel_angular_velocity[3];
       RCSOFTCHECK(rcl_publish(&wheel_publisher, &wheel_msg, NULL));
-      free(wheel_msg.data.data);
 
       imu_msg.header.stamp.sec = (uint32_t)(timer10msec_counter / 100);
       imu_msg.header.stamp.nanosec = (uint32_t)((timer10msec_counter % 100) * 10000000);
-      imu_msg.header.frame_id.capacity = 100;
-      imu_msg.header.frame_id.data = (char *)malloc(imu_msg.header.frame_id.capacity * sizeof(char));
-      imu_msg.header.frame_id.size = 0;
-      strcpy(imu_msg.header.frame_id.data, BASE_LINK);
-      imu_msg.header.frame_id.size = strlen(imu_msg.header.frame_id.data);
       imu_msg.linear_acceleration.x = g_x;
       imu_msg.linear_acceleration.y = g_y;
       imu_msg.linear_acceleration.z = g_z;
@@ -451,7 +466,6 @@ void Core0a(void *args)
       imu_msg.orientation.z = quat.z;
       imu_msg.orientation.w = quat.w;
       RCSOFTCHECK(rcl_publish(&imu_publisher, &imu_msg, NULL));
-      free(imu_msg.header.frame_id.data);
     }
 
     if (update_flag_gimbal)
@@ -460,31 +474,6 @@ void Core0a(void *args)
 
       gimbal_joint_state_msg.header.stamp.sec = (uint32_t)(timer10msec_counter / 100);
       gimbal_joint_state_msg.header.stamp.nanosec = (uint32_t)((timer10msec_counter % 100) * 10000000);
-      gimbal_joint_state_msg.header.frame_id.capacity = 100;
-      gimbal_joint_state_msg.header.frame_id.data = (char *)malloc(gimbal_joint_state_msg.header.frame_id.capacity * sizeof(char));
-      gimbal_joint_state_msg.header.frame_id.size = 0;
-      strcpy(gimbal_joint_state_msg.header.frame_id.data, BASE_LINK);
-      gimbal_joint_state_msg.header.frame_id.size = strlen(gimbal_joint_state_msg.header.frame_id.data);
-
-      gimbal_joint_state_msg.name.capacity = 2;
-      gimbal_joint_state_msg.name.data = (rosidl_runtime_c__String *)malloc(gimbal_joint_state_msg.name.capacity * sizeof(rosidl_runtime_c__String));
-      gimbal_joint_state_msg.name.size = 2;
-
-      gimbal_joint_state_msg.name.data[0].capacity = 100;
-      gimbal_joint_state_msg.name.data[0].data = (char *)malloc(gimbal_joint_state_msg.name.data[0].capacity * sizeof(char));
-      gimbal_joint_state_msg.name.data[0].size = 0;
-      strcpy(gimbal_joint_state_msg.name.data[0].data, "gimbal_base_link_joint");
-      gimbal_joint_state_msg.name.data[0].size = strlen(gimbal_joint_state_msg.name.data[0].data);
-
-      gimbal_joint_state_msg.name.data[1].capacity = 100;
-      gimbal_joint_state_msg.name.data[1].data = (char *)malloc(gimbal_joint_state_msg.name.data[1].capacity * sizeof(char));
-      gimbal_joint_state_msg.name.data[1].size = 0;
-      strcpy(gimbal_joint_state_msg.name.data[1].data, "guntop_link_joint");
-      gimbal_joint_state_msg.name.data[1].size = strlen(gimbal_joint_state_msg.name.data[1].data);
-
-      gimbal_joint_state_msg.position.capacity = 2;
-      gimbal_joint_state_msg.position.data = (double *)malloc(gimbal_joint_state_msg.position.capacity * sizeof(double));
-      gimbal_joint_state_msg.position.size = 2;
       gimbal_joint_state_msg.position.data[0] = gimbal_base_pan_angle;
       gimbal_joint_state_msg.position.data[1] = gimbal_base_tilt_angle;
 
@@ -494,11 +483,6 @@ void Core0a(void *args)
       // gimbal_joint_state_msg.data.data[3] = gimbal_map_tilt_angle;
       // gimbal_joint_state_msg.data.data[4] = gimbal_base_tilt_angle;
       RCSOFTCHECK(rcl_publish(&gimbal_joint_state_publisher, &gimbal_joint_state_msg, NULL));
-      free(gimbal_joint_state_msg.name.data[0].data);
-      free(gimbal_joint_state_msg.name.data[1].data);
-      free(gimbal_joint_state_msg.name.data);
-      free(gimbal_joint_state_msg.position.data);
-      free(gimbal_joint_state_msg.header.frame_id.data);
     }
     delayMicroseconds(10);
   }
@@ -573,16 +557,13 @@ void set_can_command(uint8_t command_no)
     {
       header_command[idx] = (command_counter[command_no] >> 8) & 0xFF;
     }
-    command_counter[command_no]++;
-
     idx++;
   }
+  command_counter[command_no]++;
   appendCRC16CheckSum(header_command, command_length);
   for (int i = 0; i < command_length; i++)
   {
-    can_command_buffer[can_command_buffer_wp] = header_command[i];
-    can_command_buffer_wp++;
-    can_command_buffer_wp %= TX_BUFFER_SIZE;
+    enqueue_can_command_byte(header_command[i]);
   }
 }
 
@@ -629,20 +610,33 @@ void onReceive(int packetSize)
   case 0x216:
     msg.can_id = ID_0x216;
     break;
+  default:
+    while (CAN.available())
+    {
+      CAN.read();
+    }
+    return;
   }
 
   msg.dlc = CAN.packetDlc();
+  if (msg.dlc > 8)
+  {
+    msg.dlc = 8;
+  }
   for (int i = 0; i < msg.dlc; i++)
   {
-    while (CAN.available())
+    if (CAN.available())
     {
       msg.data[i] = CAN.read();
-      break;
     }
   }
+  int next_wp = (buffer_wp + 1) % CAN_RX_BUFFER_SIZE;
+  if (next_wp == buffer_rp)
+  {
+    buffer_rp = (buffer_rp + 1) % CAN_RX_BUFFER_SIZE;
+  }
   rx_msg_buffer[buffer_wp] = msg;
-  buffer_wp++;
-  buffer_wp %= CAN_RX_BUFFER_SIZE;
+  buffer_wp = next_wp;
 }
 
 void error_disp()
@@ -680,8 +674,7 @@ void loop()
   // put your main code here, to run repeatedly:
   if (robomasters1_can_timeout) // Timeout
   {
-    delay(100);
-    return;
+    command_vel.enable = false;
   }
 
   // Initial Command 10sec after boot
@@ -713,9 +706,7 @@ void loop()
         appendCRC16CheckSum(header_command, command_length);
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
       }
     }
@@ -754,9 +745,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_led++;
@@ -790,9 +779,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_mode++;
@@ -824,9 +811,7 @@ void loop()
       appendCRC16CheckSum(header_command, command_length);
       for (int i = 0; i < command_length; i++)
       {
-        can_command_buffer[can_command_buffer_wp] = header_command[i];
-        can_command_buffer_wp++;
-        can_command_buffer_wp %= TX_BUFFER_SIZE;
+        enqueue_can_command_byte(header_command[i]);
       }
     }
   }
@@ -871,9 +856,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_lose++;
@@ -911,9 +894,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_lose++;
@@ -970,9 +951,7 @@ void loop()
 
           for (int i = 0; i < command_length; i++)
           {
-            can_command_buffer[can_command_buffer_wp] = header_command[i];
-            can_command_buffer_wp++;
-            can_command_buffer_wp %= TX_BUFFER_SIZE;
+            enqueue_can_command_byte(header_command[i]);
           }
 
           counter_led++;
@@ -1013,9 +992,7 @@ void loop()
 
           for (int i = 0; i < command_length; i++)
           {
-            can_command_buffer[can_command_buffer_wp] = header_command[i];
-            can_command_buffer_wp++;
-            can_command_buffer_wp %= TX_BUFFER_SIZE;
+            enqueue_can_command_byte(header_command[i]);
           }
 
           counter_blaster++;
@@ -1056,9 +1033,7 @@ void loop()
 
           for (int i = 0; i < command_length; i++)
           {
-            can_command_buffer[can_command_buffer_wp] = header_command[i];
-            can_command_buffer_wp++;
-            can_command_buffer_wp %= TX_BUFFER_SIZE;
+            enqueue_can_command_byte(header_command[i]);
           }
 
           counter_gel_blaster++;
@@ -1103,8 +1078,6 @@ void loop()
           {
             header_command[idx] = (command_counter[command_no] >> 8) & 0xFF;
           }
-          command_counter[i]++;
-
           switch (i)
           {
           case 15:
@@ -1151,12 +1124,11 @@ void loop()
 
           idx++;
         }
+        command_counter[command_no]++;
         appendCRC16CheckSum(header_command, command_length);
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
       }
 
@@ -1192,8 +1164,6 @@ void loop()
           {
             header_command[idx] = (command_counter[command_no] >> 8) & 0xFF;
           }
-          command_counter[command_no]++;
-
           switch (i)
           {
           case 16:
@@ -1214,12 +1184,11 @@ void loop()
 
           idx++;
         }
+        command_counter[command_no]++;
         appendCRC16CheckSum(header_command, command_length);
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
       }
 
@@ -1271,7 +1240,6 @@ void loop()
   // Transmit CAN Command
   while (can_command_buffer_rp != can_command_buffer_wp)
   {
-    uint8_t TxData[8];
     uint8_t dlc = 0;
 
     int can_command_buffer_size = (can_command_buffer_wp - can_command_buffer_rp + TX_BUFFER_SIZE) % TX_BUFFER_SIZE;
@@ -1305,6 +1273,7 @@ void loop()
     if (ret)
     {
       robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
+      robomasters1_can_timeout = 0;
       switch (msg.can_id)
       {
 
@@ -1357,7 +1326,7 @@ void loop()
           filtered_vel_y1 = base_odom_yaw_union[1].float_data;
           unknown_data = base_odom_yaw_union[2].float_data;
           filtered_vel_x2 = base_odom_yaw_union[3].float_data;
-          filtered_vel_y1 = base_odom_yaw_union[4].float_data;
+          filtered_vel_y2 = base_odom_yaw_union[4].float_data;
 
           update_flag_chassis1 = 1;
         }

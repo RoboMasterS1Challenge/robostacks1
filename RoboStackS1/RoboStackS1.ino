@@ -24,19 +24,30 @@ int command_control_mode;
 led command_led;
 
 #define COMMAND_VEL_TIMEOUT 150
-uint16_t command_vel_timeout_count = COMMAND_VEL_TIMEOUT;
+volatile uint16_t command_vel_timeout_count = COMMAND_VEL_TIMEOUT;
 
 #define ROBOMASTER_S1_CAN_TIMEOUT 100
-uint16_t robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
-uint8_t robomasters1_can_timeout = 0;
+volatile uint16_t robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
+volatile uint8_t robomasters1_can_timeout = 0;
 
 CANRxMsg rx_msg_buffer[CAN_RX_BUFFER_SIZE];
-int buffer_rp = 0;
-int buffer_wp = 0;
+volatile int buffer_rp = 0;
+volatile int buffer_wp = 0;
 
 uint8_t can_command_buffer[TX_BUFFER_SIZE];
 int can_command_buffer_rp = 0;
 int can_command_buffer_wp = 0;
+
+static inline void enqueue_can_command_byte(uint8_t value)
+{
+  int next_wp = (can_command_buffer_wp + 1) % TX_BUFFER_SIZE;
+  if (next_wp == can_command_buffer_rp)
+  {
+    return;
+  }
+  can_command_buffer[can_command_buffer_wp] = value;
+  can_command_buffer_wp = next_wp;
+}
 
 int initial_task_number = 0;
 
@@ -49,14 +60,11 @@ float gimbal_base_tilt_angle = 0;
 float gimbal_map_tilt_angle = 0;
 
 // Timer
-uint8_t timer10sec_flag = 0;
-uint32_t timer10sec_counter = 0;
-uint8_t timer1sec_flag = 0;
-uint32_t timer1sec_counter = 0;
-uint8_t timer10msec_flag = 0;
-uint64_t timer10msec_counter = 0;
-uint8_t timer100msec_flag = 0;
-uint32_t timer100msec_counter = 0;
+volatile uint8_t timer10sec_flag = 0;
+volatile uint8_t timer1sec_flag = 0;
+volatile uint8_t timer10msec_flag = 0;
+volatile uint64_t timer10msec_counter = 0;
+volatile uint8_t timer100msec_flag = 0;
 
 // LED
 #define LED_LIST_NUM 4
@@ -179,16 +187,13 @@ void set_can_command(uint8_t command_no)
     {
       header_command[idx] = (command_counter[command_no] >> 8) & 0xFF;
     }
-    command_counter[command_no]++;
-
     idx++;
   }
+  command_counter[command_no]++;
   appendCRC16CheckSum(header_command, command_length);
   for (int i = 0; i < command_length; i++)
   {
-    can_command_buffer[can_command_buffer_wp] = header_command[i];
-    can_command_buffer_wp++;
-    can_command_buffer_wp %= TX_BUFFER_SIZE;
+    enqueue_can_command_byte(header_command[i]);
   }
 }
 
@@ -235,20 +240,33 @@ void onReceive(int packetSize)
   case 0x216:
     msg.can_id = ID_0x216;
     break;
+  default:
+    while (CAN.available())
+    {
+      CAN.read();
+    }
+    return;
   }
 
   msg.dlc = CAN.packetDlc();
+  if (msg.dlc > 8)
+  {
+    msg.dlc = 8;
+  }
   for (int i = 0; i < msg.dlc; i++)
   {
-    while (CAN.available())
+    if (CAN.available())
     {
       msg.data[i] = CAN.read();
-      break;
     }
   }
+  int next_wp = (buffer_wp + 1) % CAN_RX_BUFFER_SIZE;
+  if (next_wp == buffer_rp)
+  {
+    buffer_rp = (buffer_rp + 1) % CAN_RX_BUFFER_SIZE;
+  }
   rx_msg_buffer[buffer_wp] = msg;
-  buffer_wp++;
-  buffer_wp %= CAN_RX_BUFFER_SIZE;
+  buffer_wp = next_wp;
 }
 
 void setup()
@@ -281,8 +299,7 @@ void loop()
   // put your main code here, to run repeatedly:
   if (robomasters1_can_timeout) // Timeout
   {
-    delay(100);
-    return;
+    command_vel.enable = false;
   }
 
   // Initial Command 10sec after boot
@@ -314,9 +331,7 @@ void loop()
         appendCRC16CheckSum(header_command, command_length);
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
       }
     }
@@ -355,9 +370,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_led++;
@@ -391,9 +404,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_mode++;
@@ -425,9 +436,7 @@ void loop()
       appendCRC16CheckSum(header_command, command_length);
       for (int i = 0; i < command_length; i++)
       {
-        can_command_buffer[can_command_buffer_wp] = header_command[i];
-        can_command_buffer_wp++;
-        can_command_buffer_wp %= TX_BUFFER_SIZE;
+        enqueue_can_command_byte(header_command[i]);
       }
     }
   }
@@ -472,9 +481,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_lose++;
@@ -512,9 +519,7 @@ void loop()
 
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
 
         counter_lose++;
@@ -571,9 +576,7 @@ void loop()
 
           for (int i = 0; i < command_length; i++)
           {
-            can_command_buffer[can_command_buffer_wp] = header_command[i];
-            can_command_buffer_wp++;
-            can_command_buffer_wp %= TX_BUFFER_SIZE;
+            enqueue_can_command_byte(header_command[i]);
           }
 
           counter_led++;
@@ -614,9 +617,7 @@ void loop()
 
           for (int i = 0; i < command_length; i++)
           {
-            can_command_buffer[can_command_buffer_wp] = header_command[i];
-            can_command_buffer_wp++;
-            can_command_buffer_wp %= TX_BUFFER_SIZE;
+            enqueue_can_command_byte(header_command[i]);
           }
 
           counter_blaster++;
@@ -657,9 +658,7 @@ void loop()
 
           for (int i = 0; i < command_length; i++)
           {
-            can_command_buffer[can_command_buffer_wp] = header_command[i];
-            can_command_buffer_wp++;
-            can_command_buffer_wp %= TX_BUFFER_SIZE;
+            enqueue_can_command_byte(header_command[i]);
           }
 
           counter_gel_blaster++;
@@ -704,8 +703,6 @@ void loop()
           {
             header_command[idx] = (command_counter[command_no] >> 8) & 0xFF;
           }
-          command_counter[i]++;
-
           switch (i)
           {
           case 15:
@@ -752,12 +749,11 @@ void loop()
 
           idx++;
         }
+        command_counter[command_no]++;
         appendCRC16CheckSum(header_command, command_length);
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
       }
 
@@ -793,8 +789,6 @@ void loop()
           {
             header_command[idx] = (command_counter[command_no] >> 8) & 0xFF;
           }
-          command_counter[command_no]++;
-
           switch (i)
           {
           case 16:
@@ -815,12 +809,11 @@ void loop()
 
           idx++;
         }
+        command_counter[command_no]++;
         appendCRC16CheckSum(header_command, command_length);
         for (int i = 0; i < command_length; i++)
         {
-          can_command_buffer[can_command_buffer_wp] = header_command[i];
-          can_command_buffer_wp++;
-          can_command_buffer_wp %= TX_BUFFER_SIZE;
+          enqueue_can_command_byte(header_command[i]);
         }
       }
 
@@ -872,7 +865,6 @@ void loop()
   // Transmit CAN Command
   while (can_command_buffer_rp != can_command_buffer_wp)
   {
-    uint8_t TxData[8];
     uint8_t dlc = 0;
 
     int can_command_buffer_size = (can_command_buffer_wp - can_command_buffer_rp + TX_BUFFER_SIZE) % TX_BUFFER_SIZE;
@@ -906,6 +898,7 @@ void loop()
     if (ret)
     {
       robomasters1_can_timeout_count = ROBOMASTER_S1_CAN_TIMEOUT;
+      robomasters1_can_timeout = 0;
       switch (msg.can_id)
       {
 
@@ -958,7 +951,7 @@ void loop()
           filtered_vel_y1 = base_odom_yaw_union[1].float_data;
           unknown_data = base_odom_yaw_union[2].float_data;
           filtered_vel_x2 = base_odom_yaw_union[3].float_data;
-          filtered_vel_y1 = base_odom_yaw_union[4].float_data;
+          filtered_vel_y2 = base_odom_yaw_union[4].float_data;
         }
 
         if (received_data[1] == 0x31 && received_data[4] == 0x03 && received_data[5] == 0x04)
